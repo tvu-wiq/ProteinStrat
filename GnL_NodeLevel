@@ -1,0 +1,384 @@
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+/* PROJECT          : Integrated Protein Promo Strategy
+    ANALYSIS PERIOD : Past 104 Weeks
+    JIRA            : CAT-4992
+    CONFLUENCE      : < INSERT LINK >
+    STAKEHOLDER     : NGP Team
+    OUTPUT          : High level switching among Protein types and dendrogram nodes
+    CREATED BY      : Tom V
+    DATE            : 17/10/2022
+    REVIEWED BY     : 
+    REVIEW DATE     : 
+  
+
+*/
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--STEP 1 : GET SKU LIST. THIS SKU LIST IS FROM NGP AND YUTING WHEN DOING THE DENDROGRAM
+
+gcp-wow-supers-rtla-qtm-dev.202207_Dendrogram_Protein.TREE_input_all
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--STEP 2: customer classfications & spending analysis
+
+--LAST 52 WEEKS TO THE MOST RECENT 52 WEEKS
+
+DECLARE POST_END DATE;
+DECLARE POST_START DATE;
+DECLARE PRE_END DATE;
+DECLARE PRE_START DATE;
+
+SET POST_END = DATE'2022-08-02';
+SET POST_START = DATE_ADD(DATE'2022-08-02', INTERVAL - (52*7 - 1) DAY);
+SET PRE_END = DATE_ADD(DATE'2022-08-02', INTERVAL - (52*7) DAY);
+SET PRE_START = DATE_ADD(DATE'2022-08-02', INTERVAL - (52*7*2 - 1) DAY);
+
+
+CREATE OR REPLACE TABLE `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Customer_Data_Volume_N2N`  AS 
+
+SELECT		M.*
+,	Sum (SALES_PRE) Over (PARTITION BY M.CRN, M.LAUNCH_DATE) AS CUST_TOTSALES_PRE_LAUNCH -- partition by launch date since doesn't matter if assortment has same launch date
+,	Sum (SALES_POST) Over (PARTITION BY M.CRN, M.LAUNCH_DATE) AS CUST_TOTSALES_POST_LAUNCH
+,	CASE WHEN Sum (SALES_PRE) Over (PARTITION BY M.CRN, M.LAUNCH_DATE) = 0 AND Sum (SALES_POST) Over (PARTITION BY M.CRN, M.LAUNCH_DATE) > 0 THEN 'NEW' ---new to universe
+				WHEN Sum (SALES_PRE) Over (PARTITION BY M.CRN, M.LAUNCH_DATE) > 0 AND Sum (SALES_POST) Over (PARTITION BY M.CRN, M.LAUNCH_DATE) = 0 THEN 'LAPSED' 
+				WHEN Sum (SALES_PRE) Over (PARTITION BY M.CRN, M.LAUNCH_DATE) > 0 AND Sum (SALES_POST) Over (PARTITION BY M.CRN, M.LAUNCH_DATE) > 0  THEN 'EXISTING' ---existing
+				ELSE 'CHECK'
+	END  AS CUST_FLAG			
+FROM
+(
+		SELECT ISS.CRN
+						,	ASSORT.CATEGORY AS ASSORTMENT  --USE ASSORTMENT TO BE CONSISTENT WITH COLUMN NAME DOWNSTREAM
+						,	'PROTEIN UNIVERSE' AS PROD_UNIVERSE
+						, POST_START as LAUNCH_DATE
+
+						,	Sum(CASE WHEN ISS.START_TXN_DATE BETWEEN PRE_START AND PRE_END THEN VOLUME ELSE 0 END)  AS SALES_PRE --USE SALES TO BE CONSISTENT WITH COLUMN NAME DOWNSTREAM. THIS IS ACTUALLY VOLUME
+						,	Sum(CASE WHEN ISS.START_TXN_DATE BETWEEN POST_START AND POST_END THEN VOLUME ELSE 0 END)  AS SALES_POST  --USE SALES TO BE CONSISTENT WITH COLUMN NAME DOWNSTREAM. THIS IS ACTUALLY VOLUME
+		
+		FROM   `gcp-wow-supers-rtla-qtm-dev.ETL.ISS`  AS ISS
+
+		INNER JOIN  `gcp-wow-supers-rtla-qtm-dev.202207_Dendrogram_Protein.TREE_input_all` AS ASSORT --corrected assortments
+				ON ISS.ARTICLE_NBR  = ASSORT.ARTICLE_NBR
+										
+		WHERE  1=1 
+					AND ISS.DIVISION_NBR = '1005'
+					AND TOT_AMT_INCLD_GST > 0
+					AND PROD_QTY > 0
+					AND ISS.START_TXN_DATE BETWEEN PRE_START AND POST_END
+
+		GROUP BY 1,2,3,4
+)M
+;
+
+
+--CHECK CUSTOMER DISTRIBUTION
+
+SELECT CUST_FLAG, COUNT(*)
+FROM `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Customer_Data_Volume_N2N`
+GROUP BY 1
+;
+
+select count(*)
+from `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Customer_Data_Volume_N2N`
+;
+
+--CHECK PERCENTAGE CHANGE IN SALES FROM PRE TO POST
+
+SELECT ASSORTMENT, SUM(SALES_POST) AS POST, SUM(SALES_PRE) AS PRE, SUM(SALES_POST) / SUM(SALES_PRE) - 1 AS PERC_CHANGE
+FROM `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Customer_Data_Volume_N2N`
+GROUP BY 1
+;
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--STEP 3: calculating net switching each product gets from existing customers 
+
+			
+CREATE OR REPLACE TABLE `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Data_Volume_N2N` AS 
+WITH A AS (
+	SELECT			
+		CRN
+		, ASSORTMENT
+		, LAUNCH_DATE
+		, SALES_POST - SALES_PRE AS CUST_PROD_CHANGE ----use cast to ensure no rounding errors 	--change from pre to post
+		, Sum(SALES_POST - SALES_PRE) Over (PARTITION BY CRN, LAUNCH_DATE) AS CUST_CHANGE					--change from pre to post at customer level
+		, CASE WHEN (SALES_POST - SALES_PRE) * Sum(SALES_POST - SALES_PRE) Over (PARTITION BY CRN, LAUNCH_DATE) > 0 THEN 1 ELSE 0 END AS CUST_PROD_CHANGE_SAMEDIRECTION
+										
+	FROM `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Customer_Data_Volume_N2N` 				
+	WHERE CUST_FLAG='EXISTING'   -- switching is considered only for existing shoppers
+), B AS (
+	SELECT
+		A.*
+		, Sum(CUST_PROD_CHANGE_SAMEDIRECTION * CUST_PROD_CHANGE) Over (PARTITION BY CRN, LAUNCH_DATE) AS CUST_PROD_CHANGE_SAMEDIRECTION_TOTAL		--THIS IS AT CUSTOMER level
+	FROM A
+), C AS (
+	SELECT 
+		B.*
+		, CASE 
+			WHEN CUST_PROD_CHANGE_SAMEDIRECTION_TOTAL <> 0 THEN 
+				CUST_PROD_CHANGE *CUST_PROD_CHANGE_SAMEDIRECTION 		-- Only to product-level changes in the same direction as total customer-level change
+				/CUST_PROD_CHANGE_SAMEDIRECTION_TOTAL								-- The above's proportion out of the total customer-level change
+				* CUST_CHANGE  																			--	Scale using total customer gains, so that sales due to spending more are obtained for the product
+			ELSE 0 END AS CUST_PROD_GAIN
+	FROM B
+)
+, D AS (
+	SELECT 
+		C.*
+		, CUST_PROD_CHANGE - CUST_PROD_GAIN AS CUST_PROD_SWITCH
+		
+	FROM C
+)
+
+SELECT 
+	D.*
+	, (Sum (Abs (CUST_PROD_SWITCH)) Over (PARTITION BY CRN, LAUNCH_DATE)) / 2 AS CUST_SWITCH --why divide by 2? --its going in/out so divide by 2 (net switching customer) - how much money you switched in universe
+
+FROM D
+;
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--STEP 4:
+--calulating switching sales for each segment and dendrogram node
+
+
+CREATE OR REPLACE TABLE `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Sales_Volume_N2N` AS 
+
+SELECT		C.CRN
+				,	C.ASSORTMENT AS TARGET_ASSORTMENT
+				,	B.ASSORTMENT AS SWITCHING_FROM_ASSORTMENT
+				,	C.LAUNCH_DATE
+
+				,	CASE WHEN C.CUST_PROD_SWITCH * B.CUST_PROD_SWITCH < 0 THEN Abs(B.CUST_PROD_SWITCH) * C.CUST_PROD_SWITCH /B.CUST_SWITCH ELSE 0 END AS SWITCHING_IN_SALES --switching from switching assortment to target assortment
+
+FROM
+			(
+			SELECT 
+				CRN
+			,	A.LAUNCH_DATE	
+			,	A.ASSORTMENT
+			,	Sum(CUST_PROD_SWITCH) AS CUST_PROD_SWITCH
+			
+		FROM `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Data_Volume_N2N` AS A
+							
+			WHERE 1=1
+--				AND ASSORTMENT LIKE '%-On Promo week%' --TOP 11 POULTRY PROMOTION
+				--AND CRN IN ('9344450420041')        
+			GROUP BY 1,2,3
+			) C
+			
+LEFT JOIN
+
+			(
+			SELECT 
+				CRN
+			,	A.LAUNCH_DATE	
+			,	ASSORTMENT
+			,	Sum(CUST_PROD_SWITCH) AS CUST_PROD_SWITCH  
+			,	Sum(CUST_SWITCH) AS CUST_SWITCH
+			
+			FROM `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Data_Volume_N2N` AS A
+  
+			WHERE
+				1=1
+				--AND ASSORTMENT NOT LIKE '%-On Promo week%' --TOP 11 POULTRY PROMOTION
+			--AND  CRN IN ('9344450420041') 
+			GROUP BY 1,2,3
+			) B
+	ON  C.CRN = B.CRN
+	AND C.ASSORTMENT <> B.ASSORTMENT --different assortment only
+;
+
+--top switching in by protein type
+
+CREATE OR REPLACE TABLE `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Sales_Volume_N2N_ProteinGroup_Type` AS
+
+SELECT
+	A.*
+	, CASE WHEN B.GroupName IS NULL THEN 'Other' ELSE B.GroupName END AS TargetGroupName
+	, CASE WHEN B.ProteinGroup IS NULL THEN 'Other' ELSE B.ProteinGroup END AS TargetProteinGroup
+
+	, CASE WHEN C.GroupName IS NULL THEN 'Other' ELSE C.GroupName END AS SwitchingGroupName
+	, CASE WHEN C.ProteinGroup IS NULL THEN 'Other' ELSE C.ProteinGroup END AS SwitchingProteinGroup
+
+FROM `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Sales_Volume_N2N` A
+
+LEFT JOIN gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.ProteinGrouping b 
+	on a.TARGET_ASSORTMENT = b.key
+
+LEFT JOIN gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.ProteinGrouping C
+	on a.SWITCHING_FROM_ASSORTMENT = C.key
+;
+
+--SWITCHING FROM ASSORTMENT TO ASSORTMENT
+
+CREATE OR REPLACE TABLE gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Sales_Volume_N2N_A2A AS
+
+SELECT 
+				TARGET_ASSORTMENT
+				, TargetGroupName
+				, TargetProteinGroup
+
+				,	SWITCHING_FROM_ASSORTMENT
+				, SwitchingGroupName
+				, SwitchingProteinGroup
+
+				,	SUM(SWITCHING_IN_SALES) AS SWITCHING_IN_SALES
+
+--				, ROW_NUMBER() OVER (PARTITION BY TargetGroupName ORDER BY SUM(SWITCHING_IN_SALES) DESC) AS RANK_WITHIN_POULTRY_GROUP
+
+FROM gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Sales_Volume_N2N_ProteinGroup_Type
+
+-- WHERE TargetProteinGroup = 'Poultry'
+-- 	AND SwitchingProteinGroup = 'Red meat'
+
+GROUP BY 1, 2, 3, 4, 5, 6
+;
+
+SELECT 
+				TargetGroupName
+				, TargetProteinGroup
+
+				, SwitchingGroupName
+				, SwitchingProteinGroup
+
+				,	SUM(SWITCHING_IN_SALES) AS SWITCHING_IN_SALES
+
+FROM gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Sales_Volume_N2N_ProteinGroup_Type
+
+GROUP BY 1, 2, 3, 4
+;
+
+--Top poultry assortments in terms of Red meat switching in
+
+SELECT 
+				TARGET_ASSORTMENT
+				, TargetGroupName
+				, TargetProteinGroup
+
+				,	SUM(SWITCHING_IN_SALES) AS SWITCHING_IN_SALES_
+
+				, ROW_NUMBER() OVER (PARTITION BY TargetGroupName ORDER BY SUM(SWITCHING_IN_SALES) DESC) AS RANK_WITHIN_POULTRY_GROUP
+
+FROM gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Sales_Volume_N2N_ProteinGroup_Type
+
+WHERE TargetProteinGroup = 'Poultry'
+	AND SwitchingProteinGroup = 'Red meat'
+
+GROUP BY 1, 2, 3
+
+HAVING SUM(SWITCHING_IN_SALES) > 20000
+;
+
+--Top poultry assortments in terms of Poultry switching in
+
+SELECT 
+				TARGET_ASSORTMENT
+				, TargetGroupName
+				, TargetProteinGroup
+
+				,	SUM(SWITCHING_IN_SALES) AS SWITCHING_IN_SALES_
+
+				, ROW_NUMBER() OVER (PARTITION BY TargetGroupName ORDER BY SUM(SWITCHING_IN_SALES) DESC) AS RANK_WITHIN_POULTRY_GROUP
+
+FROM gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Sales_Volume_N2N_ProteinGroup_Type
+
+WHERE TargetProteinGroup = 'Poultry'
+	AND SwitchingProteinGroup = 'Poultry'
+
+GROUP BY 1, 2, 3
+
+HAVING SUM(SWITCHING_IN_SALES) > 20000
+;
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--STEP 5: Final Gains & Loss output
+
+CREATE OR REPLACE TABLE `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Output_Volume_N2N` AS
+
+SELECT		B.* 
+				,	Sum(GAIN_LOSS_NET) Over (PARTITION BY Assortment) AS TOTAL_GAIN_LOSS
+
+FROM
+(
+		SELECT   	'INCREMENTAL DUE TO SPENDING MORE/LESS' AS Source_of_change
+							, DAT.Assortment AS Assortment
+							, CASE WHEN B.GroupName IS NULL THEN 'Other' ELSE B.GroupName END AS GroupName
+							, CASE WHEN B.ProteinGroup IS NULL THEN 'Other' ELSE B.ProteinGroup END AS ProteinGroup
+							, DAT.LAUNCH_DATE
+							, Sum(CUST_PROD_GAIN) AS GAIN_LOSS_NET
+
+		FROM       `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Data_Volume_N2N` AS DAT
+
+		LEFT JOIN gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.ProteinGrouping B 
+		ON DAT.Assortment = B.KEY
+
+		WHERE CRN IS NOT NULL
+--		WHERE DAT.ASSORTMENT <> 'BTC Total'
+
+		GROUP BY 1,2,3, 4, 5
+
+		UNION ALL
+
+		SELECT   'INCREMENTAL DUE TO NEW CUSTOMERS' AS Source_of_change
+							, DAT.Assortment AS Assortment
+							, CASE WHEN B.GroupName IS NULL THEN 'Other' ELSE B.GroupName END AS GroupName
+							, CASE WHEN B.ProteinGroup IS NULL THEN 'Other' ELSE B.ProteinGroup END AS ProteinGroup							
+							, DAT.LAUNCH_DATE
+							, Sum(SALES_POST) - Sum(SALES_PRE) AS GAIN_LOSS_NET
+							
+		FROM        `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Customer_Data_Volume_N2N` AS DAT
+
+
+		LEFT JOIN gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.ProteinGrouping B 
+		ON DAT.Assortment = B.KEY		
+		
+		WHERE ((CUST_FLAG = 'NEW') OR (CUST_FLAG = 'LAPSED'))
+		AND CRN IS NOT NULL
+--			AND DAT.ASSORTMENT <> 'Odd bunch'
+
+		GROUP BY 1,2,3, 4, 5
+
+		UNION ALL
+
+		SELECT  'SWITCHING' AS Source_of_change
+						 , DAT.Assortment AS Assortment
+							, CASE WHEN B.GroupName IS NULL THEN 'Other' ELSE B.GroupName END AS GroupName
+							, CASE WHEN B.ProteinGroup IS NULL THEN 'Other' ELSE B.ProteinGroup END AS ProteinGroup						 
+						 , DAT.LAUNCH_DATE
+						 ,  Sum(CUST_PROD_SWITCH)  AS GAIN_LOSS_NET
+						 
+		FROM `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Switching_Data_Volume_N2N` AS DAT
+
+		LEFT JOIN gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.ProteinGrouping B 
+		ON DAT.Assortment = B.KEY				
+
+		WHERE CRN IS NOT NULL
+		
+		GROUP BY 1,2,3, 4, 5
+		
+) B
+
+
+-- View output
+
+SELECT Assortment
+,	Source_of_change
+, GroupName
+, ProteinGroup
+,	Sum(GAIN_LOSS_NET) AS GAIN_LOST_NET
+,	Sum(TOTAL_GAIN_LOSS) AS TOTAL_GAIN_LOSS
+FROM `gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Output_Volume_N2N`
+GROUP BY 1,2, 3, 4
+ORDER BY offer_id, Assortment, Source_of_change
+;
+
+--top gaining segments from each node
+
+SELECT Assortment,	GroupName,	ProteinGroup, avg(TOTAL_GAIN_LOSS) as TOTAL_GAIN_LOSS, row_number() over (partition by ProteinGroup, GroupName order by avg(TOTAL_GAIN_LOSS) desc) as Order_
+FROM gcp-wow-supers-rtla-qtm-dev.Integrated_Protein_Strategy.Protein_Output_Volume_N2N
+WHERE ProteinGroup = 'Poultry'
+GROUP BY 1, 2, 3
+ORDER BY GroupName, Order_
+;
+
